@@ -1,0 +1,256 @@
+name: CH-AdNova
+
+networks:
+  ch-adnova-network:
+    driver: bridge
+
+volumes:
+  clickhouse_data:
+  clickhouse_logs:
+  postgres_data:
+  mongodb_data:
+  hyperdx_data:
+
+services:
+
+  # ---------------------------------------------------------------------
+  # ClickHouse — Primary Analytics Database
+  # ---------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ch-adnova-clickhouse
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8128}:8123"
+      - "${CLICKHOUSE_TCP_PORT:-9001}:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - ./clickhouse/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - ch-adnova-network
+
+  # ---------------------------------------------------------------------
+  # PostgreSQL — Langfuse Metadata Storage
+  # ---------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ch-adnova-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-langfuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-langfuse}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-langfuse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ch-adnova-network
+
+  # ---------------------------------------------------------------------
+  # MongoDB
+  # ---------------------------------------------------------------------
+  mongodb:
+    image: mongo:7
+    container_name: ch-adnova-mongodb
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ch-adnova-network
+
+  # ---------------------------------------------------------------------
+  # Langfuse
+  # ---------------------------------------------------------------------
+  langfuse:
+    image: langfuse/langfuse:2.95.1
+    container_name: ch-adnova-langfuse
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-langfuse}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-langfuse}
+      NEXTAUTH_URL: http://localhost:${LANGFUSE_PORT:-3001}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-changeme_nextauth_secret}
+      SALT: ${LANGFUSE_SALT:-changeme_salt}
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "${LANGFUSE_PORT:-3001}:3000"
+    networks:
+      - ch-adnova-network
+
+  # ---------------------------------------------------------------------
+  # ClickStack
+  # ---------------------------------------------------------------------
+  clickstack:
+    image: hyperdx/hyperdx-all-in-one:2
+    container_name: ch-adnova-clickstack
+    restart: unless-stopped
+    # The image's own /etc/local/entry.sh hardcodes IS_LOCAL_APP_MODE=REQUIRED_AUTH,
+    # which forces HyperDX into "sign up via the UI first" mode. Until that manual
+    # sign-up happens, the app never creates a ClickHouse connection or a Traces
+    # source, so the OTel Collector's `traces` pipeline stays wired to a `nop`
+    # receiver and never binds the OTLP ports (4317/4318) at all - that's why
+    # every export from the backend gets "Connection refused". Overriding the
+    # entrypoint to set the documented no-auth sentinel before sourcing the
+    # image's own entry.base.sh makes it self-provision the default ClickHouse
+    # connection + Logs/Traces/Metrics/Sessions sources on boot, which is what
+    # wires the real otlp/hyperdx receiver into the pipeline and opens 4317/4318.
+    #
+    # That self-provisioned "Local ClickHous" connection has its own bug, though:
+    # it sets host to http://localhost:8080 - HyperDX's own web UI port, not
+    # ClickHouse's HTTP port (8123), both served from this same all-in-one
+    # container. Traces still land in ClickHouse fine (the OTel Collector writes
+    # straight to ClickHouse, bypassing this "connection" entirely), but every
+    # UI search fails client-side with "ClickHouseQueryError: Method Not Allowed"
+    # (curl -X POST :8080/ returns 405, confirming it's just hitting the Next.js
+    # app instead of ClickHouse) - so the data is there but invisible in the UI.
+    # The background loop below waits for entry.base.sh to create that document,
+    # then corrects it; it's idempotent (a no-op once already 8123) so re-running
+    # on every boot is harmless, and it only touches HyperDX's own local app-state
+    # Mongo (a separate database from this project's ch_adnova data).
+    entrypoint: ["/bin/sh", "-c", "export IS_LOCAL_APP_MODE='DANGEROUSLY_is_local_app_mode💀' && (i=0; while [ $$i -lt 40 ]; do mongo hyperdx --quiet --eval 'db.connections.updateMany({host:\"http://localhost:8080\"},{$$set:{host:\"http://localhost:8123\"}})' >/dev/null 2>&1; sleep 2; i=$$((i+1)); done) & exec sh /etc/local/entry.base.sh"]
+    ports:
+      - "${CLICKSTACK_UI_PORT:-8080}:8080"
+      - "${CLICKSTACK_OTLP_HTTP_PORT:-4318}:4318"
+      - "${CLICKSTACK_OTLP_GRPC_PORT:-4317}:4317"
+    volumes:
+      - hyperdx_data:/data
+    healthcheck:
+      # The image's built-in healthcheck only probes the web UI (/api/health),
+      # which comes up long before the OTel Collector's OTLP receiver does.
+      # Check both so dependents only see "healthy" once traces can actually
+      # be exported.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/health >/dev/null && bash -c '(exec 3<>/dev/tcp/localhost/4318)' 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+    networks:
+      - ch-adnova-network
+
+  # ---------------------------------------------------------------------
+  # MCP Server
+  # ---------------------------------------------------------------------
+  mcp-server:
+    build:
+      context: ./mcp-server
+    container_name: ch-adnova-mcp-server
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_HTTP_PORT: 8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      OTEL_SERVICE_NAME: ch-adnova-mcp-server
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://clickstack:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    ports:
+      - "${MCP_SERVER_PORT:-8001}:8001"
+    networks:
+      - ch-adnova-network
+
+  # ---------------------------------------------------------------------
+  # Backend
+  # ---------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+    container_name: ch-adnova-backend
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      clickstack:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_HTTP_PORT: 8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+
+      CLICKSTACK_INGESTION_KEY: ${CLICKSTACK_INGESTION_KEY}
+
+      # Backend-to-Langfuse API calls use the Docker-internal hostname.
+      # LANGFUSE_PUBLIC_HOST is what browser-facing trace links use instead -
+      # a user's own browser can't resolve "langfuse" (that only exists on
+      # the compose network), so links built with LANGFUSE_HOST 404/hang.
+      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_PUBLIC_HOST: http://localhost:${LANGFUSE_PORT:-3001}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_PROJECT_ID: ${LANGFUSE_PROJECT_ID}
+
+      # Used only for narrative text (agents/, chat_service.py) - never for
+      # arithmetic. Every caller has a deterministic template fallback if
+      # this is blank, so leaving it unset doesn't break anything, it just
+      # means plainer prose instead of LLM-written narrative.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+
+      OTEL_SERVICE_NAME: ch-adnova-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://clickstack:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+
+      CLICKSTACK_HOST: http://clickstack:8080
+      # Browser-facing: the "View ClickStack" button's href. Passed through
+      # verbatim (not auto-derived, unlike LANGFUSE_PUBLIC_HOST above) so
+      # leaving CLICKSTACK_URL blank in .env genuinely reaches the backend
+      # as unconfigured - the frontend then disables the button with a
+      # tooltip instead of linking to a guessed address.
+      CLICKSTACK_URL: ${CLICKSTACK_URL}
+
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+    networks:
+      - ch-adnova-network
+
+  # ---------------------------------------------------------------------
+  # Frontend
+  # ---------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ch-adnova-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    networks:
+      - ch-adnova-network
